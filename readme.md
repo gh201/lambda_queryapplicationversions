@@ -1,6 +1,6 @@
 # Lambda function
 
-Filters out 
+Lists and filters out EC2 instances, queries specific url for application versions
 
 # Requirements
 
