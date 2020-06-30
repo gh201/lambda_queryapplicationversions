@@ -20,9 +20,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-func getHostFlags(targetAddress string, targetPort string, targetFlagFile string) (map[string]string, error) {
-	fmt.Println("Reading application tags file")
-
+func getApplicationTags(targetAddress string, targetPort string, targetFlagFile string) (map[string]string, error) {
 	url := "https://" + targetAddress + ":" + targetPort + "/" + targetFlagFile
 
 	fmt.Println("Reading:", url)
@@ -31,7 +29,7 @@ func getHostFlags(targetAddress string, targetPort string, targetFlagFile string
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	client := &http.Client{Transport: httpTransportSettings, Timeout: time.Second * 7}
+	client := &http.Client{Transport: httpTransportSettings, Timeout: time.Second * 5}
 	resp, err := client.Get(url)
 	if err != nil {
 		fmt.Println("Failed opening url, reason:", err)
@@ -50,7 +48,7 @@ func getHostFlags(targetAddress string, targetPort string, targetFlagFile string
 	htmlString := string(htmlResponse)
 
 	if strings.Contains(htmlString, "not found") || strings.Contains(htmlString, "HTTP Status 404") {
-		fmt.Println("Returned HTML contains 'Page not found'")
+		fmt.Println("Accessing", url, "returned 'Page not found'")
 		return nil, nil
 	}
 
@@ -66,8 +64,6 @@ func getHostFlags(targetAddress string, targetPort string, targetFlagFile string
 	for k, v := range yamlMap {
 		tagmap[k] = v
 	}
-
-	fmt.Println("Reading application tags file - complete")
 
 	return tagmap, nil
 }
@@ -117,86 +113,109 @@ func getEC2InstanceReservations(hostFilter string) ([]*ec2.Reservation, error) {
 	return result.Reservations, nil
 }
 
-func getAppServerInformation(ec2Reservations []*ec2.Reservation, targetFlagFileName string, targetPort string) []map[string]string {
+func getNodeInformation(ec2 *ec2.Instance, targetFlagFileName string, targetPort string, output chan map[string]string) {
 
-	fmt.Println("Sequential query ec2 instances")
+	nodeInfo := make(map[string]string)
 
-	appserverInformationCollection := make([]map[string]string, 0, 5)
+	nodeInfo["InstanceID"] = *ec2.InstanceId
+	nodeInfo["InstanceIP"] = *ec2.PrivateIpAddress
+	nodeInfo["InstanceLaunchTime"] = ec2.LaunchTime.String()
 
-	for _, reservation := range ec2Reservations {
-		for _, ec2Instance := range reservation.Instances {
-			nodeInfo := make(map[string]string)
-
-			nodeInfo["InstanceID"] = *ec2Instance.InstanceId
-			nodeInfo["InstanceIP"] = *ec2Instance.PrivateIpAddress
-			nodeInfo["InstanceLaunchTime"] = ec2Instance.LaunchTime.String()
-
-			for _, tag := range ec2Instance.Tags {
-				if *tag.Key == "Name" {
-					nodeInfo["InstanceName"] = *tag.Value
-					break
-				}
-			}
-
-			falgFileContent, err := getHostFlags(*ec2Instance.PrivateIpAddress, targetPort, targetFlagFileName)
-
-			if err != nil {
-				fmt.Println("Failed reading target flag file:", err)
-			}
-
-			for key, value := range falgFileContent {
-				nodeInfo[key] = value
-			}
-
-			appserverInformationCollection = append(appserverInformationCollection, nodeInfo)
+	for _, tag := range ec2.Tags {
+		if *tag.Key == "Name" {
+			nodeInfo["InstanceName"] = *tag.Value
+			break
 		}
 	}
 
-	fmt.Println("Sequential query ec2 instances - complete")
+	flagFileContent, err := getApplicationTags(*ec2.PrivateIpAddress, targetPort, targetFlagFileName)
 
-	return appserverInformationCollection
+	if err != nil {
+		fmt.Println("Failed reading target flag file:", err)
+	}
+
+	for key, value := range flagFileContent {
+		nodeInfo[key] = value
+	}
+
+	output <- nodeInfo
 }
 
-func readLambdaConfig() (map[string]string, error) {
+func queryNodesConcurrently(ec2Reservations []*ec2.Reservation, targetFlagFileName string, targetPort string) *[]map[string]string {
+
+	fmt.Println("Querying nodes")
+
+	channelSize := len(ec2Reservations)
+
+	appServersQueryResults := make(chan map[string]string, channelSize)
+	appServersInfo := make([]map[string]string, 0, 15)
+
+	for _, reservation := range ec2Reservations {
+		for _, ec2Instance := range reservation.Instances {
+			go getNodeInformation(ec2Instance, targetFlagFileName, targetPort, appServersQueryResults)
+		}
+	}
+
+	for response := range appServersQueryResults {
+		channelSize--
+
+		if channelSize > 0 {
+			appServersInfo = append(appServersInfo, response)
+		} else {
+			close(appServersQueryResults)
+		}
+	}
+
+	fmt.Println("Querying nodes - complete")
+
+	return &appServersInfo
+}
+
+type lambdaConfig struct {
+	FlagFileName        string
+	IncludedHostsFilter string
+	TargetPort          string
+}
+
+func (c *lambdaConfig) readLambdaConfig() error {
 
 	if len(os.Getenv("FlagFileName")) == 0 {
-		return nil, errors.New("Missing lambda parameter 'FlagFileName'")
+		return errors.New("Missing lambda parameter 'FlagFileName'")
 	}
 
 	if len(os.Getenv("IncludedHostsFilter")) == 0 {
-		return nil, errors.New("Missing lambda parameter 'IncludedHostsFilter'")
+		return errors.New("Missing lambda parameter 'IncludedHostsFilter'")
 	}
 
 	if len(os.Getenv("TargetPort")) == 0 {
-		return nil, errors.New("Missing lambda parameter 'TargetPort'")
+		return errors.New("Missing lambda parameter 'TargetPort'")
 	}
 
-	config := make(map[string]string)
+	c.FlagFileName = os.Getenv("FlagFileName")
+	c.IncludedHostsFilter = os.Getenv("IncludedHostsFilter")
+	c.TargetPort = os.Getenv("TargetPort")
 
-	config["FlagFileName"] = os.Getenv("FlagFileName")
-	config["IncludedHostsFilter"] = os.Getenv("IncludedHostsFilter")
-	config["TargetPort"] = os.Getenv("TargetPort")
-
-	return config, nil
+	return nil
 }
 
-func getApplicationFlags() (string, error) {
+func getAppServerInfo() (string, error) {
 
-	lambdaConfig, err := readLambdaConfig()
-
-	if err != nil {
-		return "", err
-	}
-
-	ec2Instances, err := getEC2InstanceReservations(lambdaConfig["IncludedHostsFilter"])
+	conf := lambdaConfig{}
+	err := conf.readLambdaConfig()
 
 	if err != nil {
 		return "", err
 	}
 
-	appServersInfo := getAppServerInformation(ec2Instances, lambdaConfig["FlagFileName"], lambdaConfig["TargetPort"])
+	ec2Instances, err := getEC2InstanceReservations(conf.IncludedHostsFilter)
 
-	jsonData, err := json.Marshal(appServersInfo)
+	if err != nil {
+		return "", err
+	}
+
+	appServersInfo := queryNodesConcurrently(ec2Instances, conf.FlagFileName, conf.TargetPort)
+
+	jsonData, err := json.Marshal(*appServersInfo)
 
 	if err != nil {
 		fmt.Println("Can't convert to JSON:", err)
@@ -211,7 +230,7 @@ func HandleRequest(req events.APIGatewayProxyRequest) (events.APIGatewayProxyRes
 
 	fmt.Println("Enter Lambda handler")
 
-	jsonData, err := getApplicationFlags()
+	jsonData, err := getAppServerInfo()
 
 	if err != nil {
 
